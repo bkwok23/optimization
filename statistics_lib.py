@@ -227,17 +227,7 @@ def calc_port_return(dates_list:list, initial_ticker_weights: dict, tr_matrix:pd
     return all_port_returns
 
 if __name__ == '__main__':
-    #initial portfolio weights
-    benchmark_portfolio = {"BNS CN": 1/6, "BMO CN": 1/6, "TD CN": 1/6, "CM CN": 1/6, "RY CN": 1/6, "NA CN": 1/6, "cash": 0}
-    _cash = 50/10000
-    cash_drag_portfolio = {"BNS CN": (1-_cash)/6, "BMO CN": (1-_cash)/6, "TD CN": (1-_cash)/6, "CM CN": (1-_cash)/6, "RY CN": (1-_cash)/6, "NA CN": (1-_cash)/6, "cash": _cash}
-
-    # retrieve the total returns matrix for each security
-    df_returns_matrix = calc_returns_matrix(sec_list=list(benchmark_portfolio.keys()))
-
-    benchmark = calc_port_return(dates_list=[dt.datetime(2023, 11, 30), dt.datetime(2023, 12, 1), dt.datetime(2023, 12, 4)], ticker_weights=benchmark_portfolio, tr_matrix=df_returns_matrix)
-
     banks_list = ["BNS CN", "BMO CN", "TD CN", "CM CN", "RY CN", "NA CN"]
     ret = calc_returns_matrix(banks_list)
     cov_matrix = ret.cov()
-    print(sec)
+    print(cov_matrix)
