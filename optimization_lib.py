@@ -15,7 +15,7 @@ def minimize_active_risk(benchmark_portfolio:dict, cash_drag:float, tr_matrix:pd
                          min z = xCx
            subject to:      cash > [cash_drag]
         ============================================================
-        :param benchmark_portfolio: dictionary of the universe of assets that we can use to optimize and their weights represented in the benchmark_portfolio
+        :param benchmark_portfolio: dictionary of the universe of assets that we can use to optimize and their weights represented in the benchmark_portfolio. The last asset has to be cash.
         :param cash_drag: cash drag constraint
         :param tr_matrix: returns matrix of the universe of assets
         :return:
@@ -32,12 +32,15 @@ def minimize_active_risk(benchmark_portfolio:dict, cash_drag:float, tr_matrix:pd
         # Add the decision variables and set their lower bound and upper bound (if necessary)
         _names = ["w"+str(i) for i in sec_list]
 
-        #add constrainst where assets cannot be over/under weight by 3%
+        #add constrainst where assets cannot be over/under weight by 10%
         bound = 0.1
         myProblem.variables.add(ub=[bound]*num_decision_var, lb=[-bound]*num_decision_var, names=_names)
 
         # Add constraints
-        constraint_rows = [[_names, [0, 0, 0, 0, 0, 0, 1]], [_names, [1]*num_decision_var]]
+        _constraint1_var = [0]*(num_decision_var-1)
+        _constraint1_var += [1] # assume the last asset is cash
+
+        constraint_rows = [[_names, _constraint1_var], [_names, [1]*num_decision_var]]
         myProblem.linear_constraints.add(
                 lin_expr=constraint_rows,
                 rhs=[cash_drag, 0],
