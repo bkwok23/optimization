@@ -1,0 +1,440 @@
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import Qt, QSortFilterProxyModel, QAbstractTableModel, QModelIndex
+from PyQt5.QtGui import *
+import os
+cur_dir = os.path.dirname(__file__)
+import pandas as pd
+import numpy as np
+import datetime as dt
+import os.path
+import widget_functions as wf
+from portfolio_strategies import covered_call
+from window_temp_table import TableWindow
+from create_table import TableWidget, copy_filter_table, copy_static_table
+from blp import blp
+
+import sys
+sys.path.append("Z:\\ApolloGX")
+if "\\im_dev\\" in cur_dir:
+    import im_dev.std_lib.common as common
+    import im_dev.std_lib.data_library as data_library
+    from im_dev.std_lib.bloomberg_session import *
+else:
+    import im_prod.std_lib.common as common
+    import im_prod.std_lib.data_library as data_library
+    from im_prod.std_lib.bloomberg_session import *
+
+
+def prep_table(df:pd.DataFrame, col_list:list):
+    for j in col_list:
+        if not j in df.columns.tolist():
+            df[j] = None
+    return df[col_list]
+
+class OptionWindow(QWidget):
+    def __init__(self, _fund:str, execute_date:dt.datetime, w_pos, h_pos, w_size, h_size, emsx_pull:bool=False, drill_down_holdings:bool=True, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.fund = _fund.upper()
+        self.run_date = execute_date
+        self.emsx_pull = emsx_pull
+        self.drill_down_holdings = drill_down_holdings
+        self.layout = QGridLayout(self)
+        self.setGeometry(w_pos, h_pos, w_size, h_size)
+        self.setWindowTitle(f"Option Overlay - {self.fund}")
+
+        self.add_option_cache_loc = f"Z:\\IPS\\cache\\add_option.txt"
+        df_empty = pd.DataFrame(columns=['ticker', 'currency'])
+        df_empty.to_csv(self.add_option_cache_loc, header=True, index=None, sep='\t', mode='w') #overwrite cache file
+
+        # Initialize variables before updating. These fields can update
+        self.last_update_label = QLabel("", self)
+        self.total_written = self.set_qline_edit("")
+        self.portfolio_delta = self.set_qline_edit("")
+        self.searchbar = self.set_qline_edit("")
+        self.portfolio_duration = self.set_qline_edit("")
+
+        # gather fund configurations
+        self.portfolio = covered_call(self.fund, self.run_date, emsx_pull=self.emsx_pull, drill_down_holdings=self.drill_down_holdings) # Build Portfolio trades using the index_full_replication strategy. Requires Bloomberg
+
+        # Populate Tabs in Widget
+        self.writing_percentage_table_columns = ['ticker', 'open', 'in-kind', 'sent', 'total', 'equity_wt', 'pct_written_holding', 'pct_written_fund', 'liability', 'trade value', 'intrinsic', 'pct_otm', 'queued_contracts', 'net_delta_queued', 'total_contracts', 'target_contracts', 'avg_option_net_delta', 'sec_net_delta','sec_duration','sec_option_duration','sec_option_duration_queued']
+        _display_tbl = prep_table(self.portfolio.equities_full_data, self.writing_percentage_table_columns)
+        self.writing_percentage_table = TableWidget(self.format_data_table(_display_tbl), table_type="static")
+        self.writing_percentage_table.table.setSortingEnabled(True)
+        self.writing_percentage_table.table.resizeColumnsToContents()
+
+        self.options_table_col = ['ticker', 'expiry', 'option_type', 'pct_otm', 'underlying_ticker', 'underlying_price', 'open', 'sent', 'queued', 'total', 'target_contracts', 'available_contracts', 'pct_written_contract', 'pct_written_holding', 'avg_cost', 'bid', 'ask', 'fx', 'delta', 'opt_duration','opt_duration_queued','liability', 'trade value', 'intrinsic', 'dvd_ex_date', 'dvd_rate']
+        _display_tbl = prep_table(self.portfolio.option_full_data, self.options_table_col)
+        self.options_table = TableWidget(self.format_data_table(_display_tbl), table_type="filter")
+        # self.options_table.table.setSortingEnabled(True)
+        if not self.options_table.table is None:
+            self.options_table.table.resizeColumnsToContents()
+
+        #max pct otm settings
+        df_pct_writing = pd.read_csv(f"{cur_dir}\\config\\option_pct_writing_config.csv", delimiter=",")
+        new_options = self.pull_new_options(dict(zip(df_pct_writing["fund"], df_pct_writing["option_max_pct_otm"])))
+
+        self.new_option_col = ['ticker', 'option_type', 'pct_otm', 'yield', 'underlying_price', 'days_to_maturity', 'currency']
+        _display_tbl = prep_table(new_options, self.new_option_col)
+        self.add_options_table = TableWidget(self.format_data_table(_display_tbl), table_type="filter", readonly=Qt.DisplayRole)
+        if not self.add_options_table.table is None:
+            self.add_options_table.table.resizeColumnsToContents()
+            self.add_options_table.table.setSortingEnabled(True)
+            self.add_options_table.table.doubleClicked.connect(self.add_sec)
+
+        self.update_data() #calculate portfolio trades with live pricing. Requires Bloomberg
+        self.searchbar.textChanged.connect(self.options_table.proxy_model.setFilterFixedString)
+        self.searchbar.textChanged.connect(self.add_options_table.proxy_model.setFilterFixedString)
+
+        self.tabWidget = QTabWidget()
+        self.tabWidget.addTab(self.writing_percentage_table.table, "Writing Percentage")
+        self.tabWidget.addTab(self.options_table.table, "Options")
+        self.tabWidget.addTab(self.add_options_table.table, "Add New Option")
+        # added to keep track of what tab the user is on
+        self.tabWidget.currentChanged.connect(self.tabChanged)
+        self.current_tab_index = 0
+        shortcut = QShortcut(QKeySequence('Ctrl+C'), self)
+        shortcut.activated.connect(self.copy)
+
+        shortcut = QShortcut(QKeySequence('Ctrl+F'), self)
+        shortcut.activated.connect(self.find_tca)
+
+        self.options_table.model.colorChanged.connect(self.onColorChanged)
+
+        wf.add_button(self, 'Refresh', _func=self.update_data, _row=0, _col_span=1)
+        self.layout.addWidget(self.last_update_label, 1, 0, 1, 1, Qt.AlignmentFlag.AlignLeft) # from above
+        self.layout.addWidget(QLabel("Total Percentage Written:"), 2, 0)
+        self.layout.addWidget(self.total_written, 2, 1)
+        self.layout.addWidget(QLabel("Total Portfolio Delta:"), 3, 0)
+        self.layout.addWidget(self.portfolio_delta, 3, 1)
+        self.layout.addWidget(QLabel("Total Portfolio Duration:"),4,0)
+        self.layout.addWidget(self.portfolio_duration,4,1)
+        self.layout.addWidget(QLabel("Search Options:"), 5, 0)
+        self.layout.addWidget(self.searchbar, 5, 1)
+        self.layout.addWidget(QLabel(f'Enter trades in the "Options" tab in the "queued" column. (-) Sell to Open, (+) Buy to Close. Refresh.'), 6, 0, 1, 2)
+        # self.add_button('Apply Filter', _func=self.filter_data, _row=3, _col=2, _col_span=1)
+        self.layout.addWidget(self.tabWidget, 7, 0, 1, 3) # Main Table
+        wf.add_button(self, 'Send To Trading', _func=self.send_trades, _row=8, _col=0, _col_span=1)
+        self.layout.addWidget(QLabel('To:'), 9, 0)
+        self.email_to = self.set_qline_edit('Trading@globalx.ca')
+        self.layout.addWidget(self.email_to, 9, 1, 1, 3)
+        self.email_body = self.set_qline_edit(f"{self.fund} Option Trade Recommendations.")
+        self.layout.addWidget(QLabel('Body:'), 10, 0)
+        self.layout.addWidget(self.email_body, 11, 0, 1, 4)
+        self.add_label(f"Run Date: {self.run_date.strftime('%Y.%m.%d')}", _row=12, _col_span=1)
+
+    def onColorChanged(self, row, column, color):
+        # Update cell color
+        self.options_table.table.model().dataChanged.emit(self.options_table.proxy_model.index(row, column), self.options_table.proxy_model.index(row, column))
+
+
+    def tabChanged(self, index):
+        # Tab changed event handler
+        self.current_tab_index = index
+
+    def copy(self):
+        if self.current_tab_index == 0:
+            selected_text = copy_static_table(self.tabWidget.widget(self.current_tab_index))
+        else:
+            selected_text = copy_filter_table(self.tabWidget.widget(self.current_tab_index))
+
+        clipboard = QApplication.clipboard()
+        clipboard.setText(selected_text)
+
+
+    def add_sec(self):
+        for idx in self.add_options_table.table.selectionModel().selectedIndexes():
+            _row = idx.row()
+            _ticker = self.add_options_table.proxy_model.index(_row, self.new_option_col.index("ticker")).data()
+            _currency = self.add_options_table.proxy_model.index(_row, self.new_option_col.index("currency")).data()
+            new_ticker = pd.DataFrame([[_ticker.replace(' Equity', ''), _currency]], columns=['ticker', 'currency'])
+            new_ticker.to_csv(self.add_option_cache_loc, header=False, index=None, sep='\t', mode='a')
+
+    def refresh_options_filter_table(self):
+        # https://www.pythonguis.com/faq/remove-and-insertrow-for-martin-fitzpatricks-example/
+        if not self.portfolio.option_full_data.empty:
+            new_data = self.format_data_table(self.portfolio.option_full_data[self.options_table.model.horizontalHeaders]).fillna('').values.tolist()
+            self.options_table.model.layoutAboutToBeChanged.emit()
+            self.options_table.model._data = new_data
+            self.options_table.model.layoutChanged.emit()
+
+    def refresh_add_options_filter_table(self):
+        # https://www.pythonguis.com/faq/remove-and-insertrow-for-martin-fitzpatricks-example/
+        self.options_table.model._data = self.format_data_table(self.portfolio.option_full_data[self.options_table.model.horizontalHeaders]).fillna('').values.tolist()
+        self.options_table.model.layoutChanged.emit()
+
+    def set_qline_edit(self, default_text:str="", _editable:bool=True):
+        _qline_edit = QLineEdit(self)
+        _qline_edit.setText(default_text)
+        _qline_edit.setEnabled(_editable)
+        return _qline_edit
+
+    def pull_new_options(self, max_pct_moneyness:dict):
+        bquery = blp.BlpQuery().start()
+        equity_universe = self.portfolio.equities_full_data['option_writing_ticker']
+        equity_universe_str = ','.join(f'"{item}"' for item in equity_universe)
+        max_date = self.run_date + dt.timedelta(days=70)
+        option_types = set(self.portfolio.equities_full_data['option_type'])
+
+        if max_pct_moneyness.get(self.fund) is None:
+            _max_pct_otm = 0.05 #default to 5% OTM
+        else:
+            _max_pct_otm = max_pct_moneyness.get(self.fund)
+
+        if 'call' and 'put' in option_types:
+            pct_moneyness_max = 100 + (_max_pct_otm * 100)
+            pct_moneyness_min = 100 - (_max_pct_otm * 100)
+            opt_type = ''
+        elif 'call' in option_types:
+            pct_moneyness_max = 100 + (_max_pct_otm * 100)
+            pct_moneyness_min = 99
+            opt_type = """, put_call == 'call'"""
+        else:
+            pct_moneyness_max = 101
+            pct_moneyness_min = 100 - (_max_pct_otm * 100)
+            opt_type = """, put_call == 'put'"""
+
+        bql_query = f"""
+                    get(security_des)
+                    for (filter(filter(options([{equity_universe_str}]), expire_dt < '{max_date.strftime('%Y-%m-%d')}'
+                    and between(pct_moneyness, {pct_moneyness_min}, {pct_moneyness_max})){opt_type}))
+                    """
+
+        df = bquery.bql(bql_query)
+        df = df.pivot(index='security', columns='field', values='value')
+        df.reset_index(inplace=True)
+        option_data = common.extract_option_ticker(df, 'security_des')
+        cols = ['expiry', 'option_type', 'strike', 'underlying_ticker', 'currency']
+        for i in cols:
+            data_map = getattr(option_data, i)
+            df[i] = df['security_des'].map(data_map)
+
+        df['underlying_ticker'] = np.where(df['underlying_ticker'].str.endswith(' Index'),df['underlying_ticker'],df['underlying_ticker'] + ' Equity')
+        bbg_equity_list = list(df['underlying_ticker'].unique())
+        df['ticker'] = df['security_des'] + ' ' + df['underlying_ticker'].str.split().str[-1]
+
+        bdp = BDP_Session()
+
+        bbg_prices_options = bdp.bdp_request(df['ticker'].tolist(), ['bid'])
+        bbg_prices_equities = bdp.bdp_request(bbg_equity_list, ['px_last','px_mid'])
+        bid_dict = bdp.unpact_dictionary(bbg_prices_options, fld='bid')
+        last_price_dict = bdp.unpact_dictionary(bbg_prices_equities,fld='px_last')
+        mid_price_dict = bdp.unpact_dictionary(bbg_prices_equities,fld='px_mid')
+        df['underlying_price'] = df['underlying_ticker'].map(mid_price_dict)
+        df['underlying_price'] = np.where(df['underlying_price'].isnull(),df['underlying_ticker'].map(last_price_dict),df['underlying_price'])
+        df['pct_otm'] = np.where(df['option_type'] == 'call',(df['strike']/df['underlying_price'])-1,(df['underlying_price']/df['strike'])-1)
+        df['days_to_maturity'] = (df['expiry'] - dt.date.today()).apply(lambda x: x.days-1)
+        df['yield'] = (365 / df['days_to_maturity'] * df['ticker'].map(bid_dict) / df['underlying_price'])
+
+        df = df.loc[:,['ticker','option_type','pct_otm','yield','underlying_price','days_to_maturity','currency']]
+
+        if self.portfolio.option_full_data.empty:
+            return df
+        else:
+            return df[~df['ticker'].isin(self.portfolio.option_full_data['bbg_ticker'].tolist())].reset_index(drop=True)
+
+
+
+    def pull_new_options_old(self):
+        bdp = BDP_Session()
+        equity_universe = np.unique(np.where(self.portfolio.equities_full_data['option_writing_ticker'].str.contains('Index'),
+                                             self.portfolio.equities_full_data['option_writing_ticker'],
+                                             self.portfolio.equities_full_data['option_writing_ticker'] + str(' Equity'))).tolist()
+        bbg_data = bdp.bdp_request(equity_universe, ['OPT_CHAIN', 'last price', 'currency'], ovrds={'OPTION_CHAIN_OVERRIDE': 'A'})
+        chains = bdp.unpact_option_chains(bbg_data,
+                                          option_type_override=np.unique(self.portfolio.equities_full_data['option_type']).tolist(),
+                                          max_date_override=self.run_date + dt.timedelta(days=60),
+                                          min_date_override=self.run_date,
+                                          moneyness_min_override=-0.01, moneyness_max_override=0.05)
+        df = pd.DataFrame.from_dict(chains, orient='index').rename_axis('ticker').reset_index()
+
+        bdp = BDP_Session()
+        bbg_prices = bdp.bdp_request(df['ticker'].tolist(), ['bid'])
+        bid_dict = bdp.unpact_dictionary(bbg_prices, fld='bid')
+
+        df['yield'] = (365/df['days_to_maturity'])*df['ticker'].map(bid_dict)/df['underlying_price']
+
+        if self.portfolio.option_full_data.empty:
+            return df
+        else:
+            return df[~df['ticker'].isin(self.portfolio.option_full_data['bbg_ticker'].tolist())].reset_index(drop=True)
+
+    def format_data_table(self, df:pd.DataFrame):
+        output = df.copy(deep=True)
+        col_list = df.columns.tolist()
+        for col in col_list:
+            if col in ['equity_wt', 'pct_written_holding', 'pct_written_fund', 'pct_otm', 'yield', 'pct_written_contract', 'pct_written_holding']:
+                output[col] = np.where(output[col].isnull(), output[col], (100*output[col]).map('{:.2f}%'.format))
+            elif col in ['liability', 'queued_contracts', 'total_contracts', 'open', 'in-kind', 'sent', 'queued', 'total', 'intrinsic', 'trade value', 'target_contracts', 'total_contracts_group', 'available_contracts']:
+                output[col] = np.where(output[col].isnull(), output[col], output[col].astype(float).map('{:,.0f}'.format))
+            elif col in ['delta', 'avg_cost', 'bid', 'ask', 'avg_option_net_delta', 'net_delta_queued', 'dvd_rate', 'sec_net_delta','sec_duration','sec_option_duration','sec_option_duration_queued','opt_duration','opt_duration_queued']:
+                output[col] = np.where(output[col].isnull(), output[col], output[col].astype(float).map('{:.2f}'.format))
+            elif col in ['expiry', 'dvd_ex_date']:
+                output[col] = np.where(output[col].isnull(), output[col], pd.to_datetime(output[col]).dt.strftime('%Y-%m-%d'))
+        return output
+
+    def update_data(self):
+        self.searchbar.setText('') #unfilter so that program will pick up all the queued trades
+        queued_trades_dict = {}
+        if not self.options_table.model is None:
+            ticker_col = self.options_table.model.horizontalHeaders.index('ticker')
+            queued_col = self.options_table.model.horizontalHeaders.index('queued')
+            for _row in range(self.options_table.proxy_model.rowCount()):
+                _ticker = self.options_table.proxy_model.index(_row, ticker_col).data()
+                _queued = self.options_table.proxy_model.index(_row, queued_col).data().replace(',', '')
+                queued_trades_dict.update({_ticker: float(_queued)})
+
+        self.portfolio.update_data(queued_trades_dict)
+        self.total_written.setText("{:.1f}%".format(100*self.portfolio.equities_full_data['pct_written_fund'].sum()))
+        self.portfolio_delta.setText("{:.2f}".format((self.portfolio.equities_full_data['equity_wt']*self.portfolio.equities_full_data['sec_net_delta']).sum()))
+        self.portfolio_duration.setText("{:.2f}".format((self.portfolio.equities_full_data['equity_wt'] * self.portfolio.equities_full_data['sec_duration']).sum() + (self.portfolio.equities_full_data['sec_option_duration_queued'] + self.portfolio.equities_full_data['sec_option_duration']).sum()))
+        # update widgets
+        self.update_writing_percentage_table()
+        self.refresh_options_filter_table()
+        self.conditional_formatting()
+        # self.refresh_add_options_filter_table()
+
+        # update values
+        self.last_update_label.setText(f"Last Update: {dt.datetime.now().strftime('%H:%M:%S')}")
+
+    def update_writing_percentage_table(self):
+        _update_col = ['pct_written_holding', 'pct_written_fund', 'queued_contracts', 'total_contracts', 'target_contracts', 'liability', 'trade value', 'pct_otm', 'avg_option_net_delta', 'sec_net_delta', 'net_delta_queued', 'in-kind', 'sent', 'total','sec_option_duration_queued','sec_option_duration']
+        _tbl_data = self.format_data_table(self.portfolio.equities_full_data).fillna('').values.tolist()
+        for col in _update_col:
+            input_col = self.portfolio.equities_full_data.columns.get_loc(col)
+            output_col = self.writing_percentage_table_columns.index(col)
+            for i in range(len(_tbl_data)):
+                self.writing_percentage_table.table.setItem(i, output_col, QTableWidgetItem(str(_tbl_data[i][input_col])))
+
+    def conditional_formatting(self):
+
+        ticker_col = self.options_table.model.horizontalHeaders.index('ticker')
+        open_col = self.options_table.model.horizontalHeaders.index('open')
+        queued_col = self.options_table.model.horizontalHeaders.index('queued')
+        total_col = self.options_table.model.horizontalHeaders.index('total')
+        otm_col = self.options_table.model.horizontalHeaders.index('pct_otm')
+        expiry_col = self.options_table.model.horizontalHeaders.index('expiry')
+
+        for _row in range(self.options_table.proxy_model.rowCount()):
+            _open = self.options_table.proxy_model.index(_row, open_col).data().replace(',', '')
+            _open_fl = 0 if _open == "" else float(_open)
+            _total = self.options_table.proxy_model.index(_row, total_col).data().replace(',', '')
+
+            _queued = self.options_table.proxy_model.index(_row, queued_col).data().replace(',', '')
+            _otm = self.options_table.proxy_model.index(_row, otm_col).data().replace('%', '')
+            _expiry = dt.datetime.strptime(self.options_table.proxy_model.index(_row, expiry_col).data(), "%Y-%m-%d")
+
+            if (float(_total) > 0):
+                # flag if we are writing naked options
+                self.options_table.model.setCellColor(_row, int(total_col), QColor(255, 235, 156))
+            else:
+                self.options_table.model.setCellColor(_row, int(total_col), QColor(255, 255, 255))
+
+            if ((_expiry.day==self.run_date.day) and (_expiry.month==self.run_date.month) and (_expiry.year==self.run_date.year)) and (float(_queued) > 0) and (float(_otm)>0):
+                self.options_table.model.setCellColor(_row, int(queued_col), QColor(255, 235, 156))
+            else:
+                self.options_table.model.setCellColor(_row, int(queued_col), QColor(255, 255, 255))
+
+            if (float(_queued) < 0) and (float(_otm)<0):
+                # flag if we are writing ITM options
+                self.options_table.model.setCellColor(_row, int(queued_col), QColor(255, 235, 156))
+                self.options_table.model.setCellColor(_row, int(otm_col), QColor(255, 235, 156))
+            else:
+                self.options_table.model.setCellColor(_row, int(queued_col), QColor(255, 255, 255))
+                self.options_table.model.setCellColor(_row, int(otm_col), QColor(255, 255, 255))
+
+    def symbol_legend(self):
+        output_str = "<table>"
+        output_str += "<tr>" + "<td>C = BUY</td>" + "<td>B = BUY</td>" + "</tr>"
+        output_str += "<tr>" + "<td>H = SELL</td>" + "<td>S = SELL</td>" + "</tr>"
+        output_str += "</table>"
+        return output_str
+
+    def download_tmx_options_data(self, _data:pd.DataFrame):
+        _config_file = f"Z:\\IPS\\python\\webscraping\\config\\{self.run_date.strftime('%Y%m%d')}_tmx_config.csv"
+        _columns = ['ticker', 'start_time', 'end_time']
+
+        output = pd.DataFrame(columns=_columns)
+        _data[['ticker_only', 'country_code']] = _data['underlying_ticker'].str.split(' ', expand=True)
+        _data = _data[_data['country_code']=='CN'].reset_index(drop=True)
+        
+        if not _data.empty:
+            output['ticker'] = np.unique(_data['ticker_only'])
+            _timestamp = dt.datetime.now()
+            output['start_time'] = _timestamp.strftime('%Y-%m-%d %H:%M')
+            output['end_time'] = (_timestamp + dt.timedelta(minutes=60)).strftime('%Y-%m-%d %H:%M')
+    
+            if os.path.isfile(_config_file):
+                output.to_csv(_config_file, header=False, index=False, sep=',', mode='a')
+            else:
+                output.to_csv(_config_file, header=True, index=False, sep=',', mode='w')
+
+    def send_trades(self):
+        df_trades = self.portfolio.option_full_data[abs(self.portfolio.option_full_data['queued']) > 0].reset_index(drop=True) # trade value greater than $1000
+        df_trades = df_trades.sort_values(['underlying_ticker', 'queued'], ascending=[True, False])
+
+        df_trades['ticker'] = df_trades['ticker']
+        df_trades['start'] = df_trades['open'].fillna(0) + df_trades['sent'].fillna(0)
+        df_trades['trade_same_direction'] = np.where(df_trades['start']==0, True, np.where(np.sign(df_trades['start'])==np.sign(df_trades['queued']), True, False))
+        df_trades['trade'] = np.where(df_trades['trade_same_direction'], np.where(df_trades['queued']<0, "H", "B"), np.where(df_trades['queued']<0, "S", "C"))
+        df_trades['bbg_quantity'] = abs(df_trades['queued'])
+        df_trades['bbg_limit'] = None
+
+        self.portfolio.trade.build_tkt_blotter(df_trades, order_type="MKT", time_enforce='Day')
+        trades_blotter = self.portfolio.trade.build_option_trade_blotter(df_trades) # builds trade blotter and saves a copy
+        trades_blotter_old_format = self.portfolio.trade.build_trade_blotter_old_format(trades_blotter, sec_type="Option")
+        save_loc = f"Z:\\IPS\\trades\\blotter\\{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_trade_blotter.csv"
+        trades_blotter_old_format.to_csv(save_loc, index=False)
+
+        if not trades_blotter.empty:
+
+            self.download_tmx_options_data(df_trades)
+
+            trades_email_format = self.portfolio.trade.convert_trades_email_format(trades_blotter) # convert
+            if self.portfolio.option_full_data['trade value'].sum() > 0:
+                net_trading = "(cash raise)"
+            else:
+                net_trading = "(cash spend)"
+
+            import win32com.client as win32
+            outlook = win32.Dispatch("Outlook.Application")
+            mail1 = outlook.CreateItem(0)
+            mail1.To = self.email_to.text()
+            mail1.Subject = f"PM Trades: Option Trades - {self.fund} {dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            mail1.HTMLBody = (self.email_body.text() + str('<br><br>') + self.symbol_legend() + str('<br>') +
+                             "Trade Value: <b>${:,.0f}</b>".format(self.portfolio.option_full_data['trade value'].sum()) + str(' ') + net_trading + str('<br><br>') +
+                             common.dfToHTML(trades_email_format))
+            mail1.Attachments.Add(save_loc)
+            mail1.Save()
+            
+        else:
+            print('No Trades')
+
+    def add_label(self, _label_name:str, _row:int, _col:int=0, _row_span:int=1, _col_span:int=0, _align=Qt.AlignmentFlag.AlignLeft):
+        self.layout.addWidget(QLabel(_label_name), _row, _col, _row_span, _col_span, _align)
+
+    def find_tca(self):
+        if self.current_tab_index == 1:
+            _tbl = self.tabWidget.widget(self.current_tab_index)
+            selected_ranges = _tbl.selectionModel().selectedIndexes()
+            selected_text = selected_ranges[0].data()
+
+            conn = common.db_connection()
+            str_sql = (f"""SELECT CONVERT(varchar(25), trade_date, 120) AS trade_date, underlying_ticker, option_ticker, side,
+                            quantity, execution_price, bid, ask, strike, '' as pct_otm, calculated_implied_vol, CONVERT(varchar(10), expiry, 126) AS expiry, underlying_last_price, broker 
+                        FROM tca_analytics 
+                        WHERE underlying_ticker IN ('{selected_text}') and side = 'sell to open' 
+                        ORDER BY trade_date DESC;""")
+            _dataset = conn.query_tbl(str_sql)
+            _dataset["pct_otm"] = (100*(_dataset["strike"]/_dataset["underlying_last_price"]-1)).map("{:.2f}%".format)
+            _dataset["calculated_implied_vol"] = np.where(_dataset["calculated_implied_vol"].isnull(), "", (100 * _dataset["calculated_implied_vol"]).map("{:.2f}%".format))
+            self.orders_window = TableWindow(f"Trade Cost Analysis", _dataset, "filter", 700, 200, 1150, 700)
+            self.orders_window.show()
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = OptionWindow("BKCC", dt.datetime.now(), 410, 240, 1100, 600)
+    window.show()
+    sys.exit(app.exec())

@@ -1,0 +1,337 @@
+from __future__ import print_function
+from __future__ import absolute_import
+import blpapi
+from optparse import OptionParser
+import datetime as dt
+import pandas as pd
+
+class option_sec():
+    def __init__(self, ticker:str, stock_price:float, timestamp:str):
+        option_type_map = {'C': 'call', 'P': 'put'}
+        self.ticker_split = ticker.split(' ')
+        self.underlying_price = stock_price
+        self.strike = float(self.ticker_split[3][1:])
+        self.option_type = option_type_map.get(self.ticker_split[3][0])
+        self.maturity = dt.datetime.strptime(self.ticker_split[2], '%m/%d/%y')
+        if self.option_type == 'call':
+            self.pct_otm = self.strike/self.underlying_price-1
+        elif self.option_type == 'put':
+            self.pct_otm = self.underlying_price/self.strike-1
+        self.timestamp = timestamp
+
+class BDP_Session():
+    def parseCmdLine(self):
+        parser = OptionParser(description="Retrieve realtime data.")
+        parser.add_option("-a",
+                          "--ip",
+                          dest="host",
+                          help="server name or IP (default: %default)",
+                          metavar="ipAddress",
+                          default="localhost")
+        parser.add_option("-p",
+                          dest="port",
+                          type="int",
+                          help="server port (default: %default)",
+                          metavar="tcpPort",
+                          default=8194)
+        parser.add_option("--me",
+                          dest="maxEvents",
+                          type="int",
+                          help="stop after this many events (default: %default)",
+                          metavar="maxEvents",
+                          default=1000000)
+
+        (bloomberg_options, args) = parser.parse_args()
+        return bloomberg_options
+
+    def build_session(self):
+        # Fill SessionOptions
+        sessionOptions = blpapi.SessionOptions()
+        sessionOptions.setServerHost(self.options.host)
+        sessionOptions.setServerPort(self.options.port)
+
+        print("Connecting to %s:%d" % (self.options.host, self.options.port))
+        # Create a Session
+        _bloomberg_session = blpapi.Session(sessionOptions)
+        # Start a Session
+        if not _bloomberg_session.start():
+            print("Failed to start session.")
+        return _bloomberg_session
+
+    def _element_to_dict(self, elem):
+        if isinstance(elem, str):
+            return elem
+        dtype = elem.datatype()
+        if dtype == blpapi.DataType.CHOICE:
+            return {str(elem.name()): self._element_to_dict(elem.getChoice())}
+        elif elem.isArray():
+            return [self._element_to_dict(v) for v in elem.values()]
+        elif dtype == blpapi.DataType.SEQUENCE:
+            return {str(elem.name()): {str(e.name()): self._element_to_dict(e) for e in elem.elements()}}  # NOQA
+        else:
+            if elem.isNull():
+                value = None
+            else:
+                try:
+                    value = elem.getValue()
+                except:  # NOQA
+                    value = None
+            return value
+
+    def _message_to_dict(self, msg):
+        return {
+            'correlationIds': [cid.value() for cid in msg.correlationIds()],
+            'messageType': "{}".format(msg.messageType()),
+            # 'topicName': msg.topicName(),
+            'element': self._element_to_dict(msg.asElement())
+        }
+
+    def _parse_req_hist(self, blpapi_msg:str, flds:list)->dict:
+        output = {}
+        _message = self._message_to_dict(blpapi_msg)
+        d = _message['element']['HistoricalDataResponse']
+        for _key, secData in d.items():
+            ticker = secData['security']
+            fld_dict = {}
+            for fld in flds:
+                sub_fld_dict = {}
+                if str('securityError') in secData:
+                    fld_dict.update({fld: str('#N/A Invalid Security')})
+                else:
+                    for _fld_data in secData.get('fieldData'):
+                        if _fld_data.get('fieldData').get(fld) is None:
+                            # sub_fld_dict.update({fld: None})
+                            pass
+                        else:
+                            sub_fld_dict.update({_fld_data.get('fieldData').get('date'): _fld_data.get('fieldData').get(fld)})
+                    fld_dict.update({fld: sub_fld_dict})
+            output.update({ticker: fld_dict})
+        return output
+
+    def _parse_req(self, blpapi_msg:str, flds:list)->dict:
+        output = {}
+        _message = self._message_to_dict(blpapi_msg)
+        d = _message['element']['ReferenceDataResponse']
+        for security_data_dict in d:
+            secData = security_data_dict['securityData']
+            ticker = secData['security']
+            fld_dict = {}
+            for fld in flds:
+                if str('securityError') in secData:
+                    fld_dict.update({fld: str('#N/A Invalid Security')})
+                else:
+                    _fld_data = secData.get('fieldData').get('fieldData')
+                    if _fld_data.get(fld) is None:
+                        fld_dict.update({fld: None})
+                    else:
+                        fld_dict.update({fld: _fld_data.get(fld)})
+            fld_dict.update({'timestamp': str(self.timestamp.strftime('%H:%M:%S'))})
+            output.update({ticker: fld_dict})
+        return output
+
+    def bdp_request(self, ticker:list, flds:list, ovrds:dict=None)->dict:
+        self.options = self.parseCmdLine()
+        self.session = self.build_session()
+
+        # Bloomberg Request
+        self.timestamp = dt.datetime.now()
+        self.session.openService("//blp/refdata")
+        refDataService = self.session.getService("//blp/refdata")
+
+        # request input data. Identifiers and Fields
+        requests = refDataService.createRequest('ReferenceDataRequest')
+        for sec in ticker:
+            requests.getElement('securities').appendValue(sec)
+        for fld in flds:
+            requests.getElement('fields').appendValue(fld)
+
+        if not ovrds is None:
+            overrides = requests.getElement('overrides')
+            for ovrd_fld, ovrd_val in ovrds.items():
+                ovrd = overrides.appendElement()
+                ovrd.setElement('fieldId', ovrd_fld)
+                ovrd.setElement('value', ovrd_val)
+
+        # send request
+        eventQueue = blpapi.EventQueue()
+        self.session.sendRequest(requests, eventQueue=eventQueue)
+        output = {}
+        #retrieve data
+        while True:
+            # event = self.session.nextEvent()
+            event = eventQueue.nextEvent()
+            for msg in event:
+                output = {**output, **self._parse_req(msg, flds)}
+            if event.eventType() in [blpapi.Event.RESPONSE]:
+                self.session.stop()
+                return output
+
+    def bdh_request(self, ticker:list, flds:list, start_date:dt.datetime, end_date:dt.datetime, ovrds:dict=None, other_set_vals:dict=None)->dict:
+        #ovrds: {'OPTION_CHAIN_OVERRIDE': 'A'}
+        #other_set_vals: {'currency': 'USD'}
+
+        self.options = self.parseCmdLine()
+        self.session = self.build_session()
+
+        # Bloomberg Request
+        self.timestamp = dt.datetime.now()
+        self.session.openService("//blp/refdata")
+        refDataService = self.session.getService("//blp/refdata")
+
+        # request input data. Identifiers and Fields
+        requests = refDataService.createRequest('HistoricalDataRequest')
+        for sec in ticker:
+            requests.getElement('securities').appendValue(sec)
+        for fld in flds:
+            requests.getElement('fields').appendValue(fld)
+
+        setvals = []
+        setvals.append(('startDate', start_date.strftime("%Y%m%d")))
+        setvals.append(('endDate', end_date.strftime("%Y%m%d")))
+
+        if not other_set_vals is None:
+            for other_fld, other_val in other_set_vals.items():
+                setvals.append((other_fld, other_val))
+
+
+        # setvals.append(('currency', "USD"))
+        for name, val in setvals:
+            requests.set(name, val)
+
+        if not ovrds is None:
+            overrides = requests.getElement('overrides')
+            for ovrd_fld, ovrd_val in ovrds.items():
+                ovrd = overrides.appendElement()
+                ovrd.setElement('fieldId', ovrd_fld)
+                ovrd.setElement('value', ovrd_val)
+
+        # send request
+        eventQueue = blpapi.EventQueue()
+        self.session.sendRequest(requests, eventQueue=eventQueue)
+        output = {}
+        #retrieve data
+        while True:
+            # event = self.session.nextEvent()
+            event = eventQueue.nextEvent()
+            for msg in event:
+                output = {**output, **self._parse_req_hist(msg, flds)}
+            if event.eventType() in [blpapi.Event.RESPONSE]:
+                self.session.stop()
+                return output
+
+    def bdh_tick(self, ticker:list, flds:list, start_date:dt.datetime, end_date:dt.datetime)->dict:
+        self.options = self.parseCmdLine()
+        self.session = self.build_session()
+
+        # Bloomberg Request
+        self.timestamp = dt.datetime.now()
+        self.session.openService("//blp/refdata")
+        refDataService = self.session.getService("//blp/refdata")
+
+        requests = refDataService.createRequest('IntradayTickRequest')
+        requests.set("security", ticker)
+        eventTypes = requests.getElement("eventTypes")
+        eventTypes.appendValue("TRADE")
+        eventTypes.appendValue("BID")
+        eventTypes.appendValue("ASK")
+        # # request input data. Identifiers and Fields
+
+        # for sec in ticker:
+        #     requests.getElement('securities').appendValue(sec)
+        # for fld in flds:
+        #     requests.getElement('fields').appendValue(fld)
+
+        setvals = []
+        setvals.append(('startDateTime', start_date.strftime("%Y%m%dT%H:%M:%S")))
+        setvals.append(('endDateTime', end_date.strftime("%Y%m%dT%H:%M:%S")))
+
+        for name, val in setvals:
+            requests.set(name, val)
+
+        # send request
+        eventQueue = blpapi.EventQueue()
+        self.session.sendRequest(requests, eventQueue=eventQueue)
+        output = {}
+        #retrieve data
+        while True:
+            # event = self.session.nextEvent()
+            event = eventQueue.nextEvent()
+            for msg in event:
+                output = {**output, **self._parse_req_hist(msg, flds)}
+            if event.eventType() in [blpapi.Event.RESPONSE]:
+                self.session.stop()
+                return output
+
+    def bdp_subscribe(self, ticker:list, flds:list, interval:float=10.0)->dict:
+        self.options = self.parseCmdLine()
+        self.session = self.build_session()
+
+        # Bloomberg Subscribe
+        subscriptions = blpapi.SubscriptionList()
+
+        for sec in ticker:
+            subscriptions.add(str(sec), flds, "interval=" + str(interval), blpapi.CorrelationId(str(sec)))
+
+        # send subscription
+        self.session.subscribe(subscriptions)
+
+        keep_going = True
+        while keep_going:
+            event = self.session.nextEvent()
+            if event.eventType() == blpapi.Event.SUBSCRIPTION_DATA:
+                for msg in event:
+                    if msg.hasElement('PRICE_LAST_BID_RT') or msg.hasElement('PRICE_LAST_ASK_RT'):
+                        _identifier = msg.correlationIds()[0].value()
+                        _bid = msg.getElement('PRICE_LAST_BID_RT').getValue()
+                        _ask = msg.getElement('PRICE_LAST_ASK_RT').getValue()
+                        _bidtime = msg.getElement('LAST_BID_TIME_TODAY_REALTIME').getValue()
+                        _asktime = msg.getElement('LAST_ASK_TIME_TODAY_REALTIME').getValue()
+                        print(f'ID:{_identifier} BID:{_bid} - {_bidtime} ASK:{_ask} - {_asktime}')
+        self.session.stop()
+
+    def unpact_dictionary(self, data:dict, fld:str, remove_equity_str:bool=False):
+        output = {}
+        for k, v in data.items():
+            if remove_equity_str:
+                k = k.replace(' Equity', '')
+            output[k] = v.get(fld)
+            if "#N/A" in str(output[k]):
+                output[k] = None
+        return output
+
+    def unpact_option_chains(self, data:dict,
+                             option_type_override:list=['call', 'put'],
+                             max_date_override:dt.datetime=None,
+                             min_date_override:dt.datetime=None,
+                             moneyness_min_override:float=-1,
+                             moneyness_max_override:float=1):
+
+        opt_chain_list = {}
+        for k, v in data.items():
+            opt_chains = v.get('OPT_CHAIN')
+            underlying_price = v.get('last price')
+            if not v.get('currency') is None:
+                currency = v.get('currency')
+            else:
+                currency = ''
+            timestamp = v.get('timestamp')
+            if not opt_chains is None:
+                for opt_ticker_cls in opt_chains:
+                    opt_ticker = opt_ticker_cls.get('OPT_CHAIN').get('Security Description')
+                    opt = option_sec(opt_ticker, underlying_price, timestamp)
+                    if (max_date_override is None) or (opt.maturity.date() > max_date_override.date()): #filter maturity date
+                        break
+                    if opt.option_type in option_type_override:
+                        if (opt.pct_otm >= moneyness_min_override) and (opt.pct_otm <= moneyness_max_override) and (opt.maturity.date()>=min_date_override.date()):
+                            opt_chain_list[opt_ticker] = {'option_type': opt.option_type,
+                                                          'pct_otm': opt.pct_otm,
+                                                          'strike': opt.strike,
+                                                          'maturity': opt.maturity.date(),
+                                                          'days_to_maturity': (opt.maturity-dt.datetime.now()).days,
+                                                          'underlying_price': opt.underlying_price,
+                                                          'currency': currency,
+                                                          'timestamp': opt.timestamp}
+        return opt_chain_list
+
+if __name__ == '__main__':
+    print("Hello World")
