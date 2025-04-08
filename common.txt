@@ -20,12 +20,12 @@ class db_connection():
             server = 'hemi-ips-sql-srv.database.windows.net'
             database = 'hemi-ips-db'
             username = 'ips_login'
-            password = 'BxigZoHCdWdvnp*MtX3V!Uia'
-        elif database_conn == "globalx":
+            password = ''
+        elif database_conn == "global":
             server = 'hemi-fund-sql-srv.database.windows.net'
             database = 'hemi-fund-db-prod'
             username = 'ipsdev'
-            password = 'qmb*pht0pnp8RGT3wzm'
+            password = ''
         else:
             raise ValueError(f"Error connecting to: {database_conn}. Please specify a proper database to connect to.")
 
